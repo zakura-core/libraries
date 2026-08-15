@@ -7,6 +7,11 @@ and this project adheres to Rust's notion of
 
 ## [Unreleased]
 
+### Added
+
+- The non-default `prover-fixed-msm-table` feature forwards Halo 2's
+  proving-only fixed-base table and shares it across Orchard parameter clones.
+
 ### Changed
 
 - CI now runs a focused proof-creation, individual-verification, and
