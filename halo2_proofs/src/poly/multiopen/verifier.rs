@@ -11,7 +11,12 @@ use super::{
 use crate::arithmetic::{eval_polynomial, lagrange_interpolate, CurveAffine};
 use crate::transcript::{EncodedChallenge, TranscriptRead};
 
-/// Verify a multi-opening proof
+/// Verify a multi-opening proof.
+///
+/// # Errors
+///
+/// Returns [`Error::OpeningError`] if `queries` is empty or contains more than
+/// one query for the same commitment at the same point.
 pub fn verify_proof<
     'r,
     'params: 'r,
