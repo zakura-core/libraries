@@ -95,7 +95,15 @@ impl<E, B: Basis> AstLeaf<E, B> {
 /// - Finally, we call [`Evaluator::evaluate`] passing in the [`Ast`].
 pub(crate) struct Evaluator<E, F: Field, B: Basis> {
     polys: Vec<Polynomial<F, B>>,
+    compressed_selectors: Vec<CompressedSelectorLeaf<E, B>>,
     _context: E,
+}
+
+struct CompressedSelectorLeaf<E, B: Basis> {
+    query: AstLeaf<E, B>,
+    combination_len: usize,
+    assigned_root: usize,
+    selector: AstLeaf<E, B>,
 }
 
 /// Constructs a new `Evaluator`.
@@ -107,6 +115,7 @@ pub(crate) struct Evaluator<E, F: Field, B: Basis> {
 pub(crate) fn new_evaluator<E: Fn() + Clone, F: Field, B: Basis>(context: E) -> Evaluator<E, F, B> {
     Evaluator {
         polys: vec![],
+        compressed_selectors: vec![],
         _context: context,
     }
 }
@@ -1432,6 +1441,62 @@ impl<E, F: Field, B: Basis> Evaluator<E, F, B> {
         }
     }
 
+    pub(crate) fn register_compressed_selector(
+        &mut self,
+        query: AstLeaf<E, B>,
+        combination_len: usize,
+        assigned_root: usize,
+        selector: AstLeaf<E, B>,
+    ) {
+        self.compressed_selectors.push(CompressedSelectorLeaf {
+            query,
+            combination_len,
+            assigned_root,
+            selector,
+        });
+    }
+
+    fn replace_compressed_selectors(&self, ast: &Ast<E, F, B>) -> Ast<E, F, B>
+    where
+        E: Copy,
+    {
+        if let Some((query, combination_len, assigned_root)) = compressed_selector(ast, -F::ONE) {
+            if let Some(selector) = self.compressed_selectors.iter().find(|selector| {
+                selector.query == *query
+                    && selector.combination_len == combination_len
+                    && selector.assigned_root == assigned_root
+            }) {
+                return Ast::Poly(selector.selector);
+            }
+        }
+
+        match ast {
+            Ast::Poly(leaf) => Ast::Poly(*leaf),
+            Ast::Add(lhs, rhs) => Ast::Add(
+                Arc::new(self.replace_compressed_selectors(lhs)),
+                Arc::new(self.replace_compressed_selectors(rhs)),
+            ),
+            Ast::Mul(AstMul(lhs, rhs)) => Ast::Mul(AstMul(
+                Arc::new(self.replace_compressed_selectors(lhs)),
+                Arc::new(self.replace_compressed_selectors(rhs)),
+            )),
+            Ast::Scale(inner, scalar) => {
+                Ast::Scale(Arc::new(self.replace_compressed_selectors(inner)), *scalar)
+            }
+            Ast::DistributePowers(terms, base) => Ast::DistributePowers(
+                Arc::new(
+                    terms
+                        .iter()
+                        .map(|term| self.replace_compressed_selectors(term))
+                        .collect(),
+                ),
+                *base,
+            ),
+            Ast::LinearTerm(value) => Ast::LinearTerm(*value),
+            Ast::ConstantTerm(value) => Ast::ConstantTerm(*value),
+        }
+    }
+
     /// Evaluates the given polynomial operation against this context.
     pub(crate) fn evaluate(
         &self,
@@ -1899,7 +1964,8 @@ impl<E, F: Field, B: Basis> Evaluator<E, F, B> {
         // polynomial.
         let minus_one = -F::ONE;
         let two = F::ONE.double();
-        let mut plan = EvaluationPlan::compile(ast);
+        let ast = self.replace_compressed_selectors(ast);
+        let mut plan = EvaluationPlan::compile(&ast);
         let cache_slots = plan.cache_common_subexpressions();
         let mut result = B::empty_poly(domain);
         let scratch_slots = plan.required_scratch_slots();
@@ -3419,6 +3485,15 @@ mod tests {
             .into_iter()
             .map(|body| evaluator.register_poly(body))
             .collect::<Vec<_>>();
+
+        for assigned_root in 1..=COMBINATION_LEN {
+            let mut selector = domain.empty_extended();
+            for (selector, query) in selector.iter_mut().zip(&query_values) {
+                *selector = compressed_selector_value(*query, COMBINATION_LEN, assigned_root);
+            }
+            let selector = evaluator.register_poly(selector);
+            evaluator.register_compressed_selector(query, COMBINATION_LEN, assigned_root, selector);
+        }
 
         let mut terms = vec![];
         let mut control_terms = vec![];

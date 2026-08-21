@@ -147,7 +147,16 @@ pub struct ProvingKey<C: CurveAffine> {
     fixed_values: Vec<Polynomial<C::Scalar, LagrangeCoeff>>,
     fixed_polys: Vec<Polynomial<C::Scalar, Coeff>>,
     fixed_cosets: Vec<Polynomial<C::Scalar, ExtendedLagrangeCoeff>>,
+    compressed_selector_cosets: Vec<CompressedSelectorCoset>,
     permutation: permutation::ProvingKey<C>,
+}
+
+#[derive(Clone, Debug)]
+struct CompressedSelectorCoset {
+    column_index: usize,
+    combination_len: usize,
+    assigned_root: usize,
+    selector_index: usize,
 }
 
 impl<C: CurveAffine> ProvingKey<C> {
