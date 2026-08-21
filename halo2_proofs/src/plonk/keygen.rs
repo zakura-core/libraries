@@ -219,7 +219,7 @@ where
     )?;
 
     let mut fixed = batch_invert_assigned(assembly.fixed);
-    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors);
+    let (cs, selector_polys, _) = cs.compress_selectors(assembly.selectors);
     fixed.extend(
         selector_polys
             .into_iter()
@@ -280,7 +280,7 @@ where
     )?;
 
     let mut fixed = batch_invert_assigned(assembly.fixed);
-    let (cs, selector_polys) = cs.compress_selectors(assembly.selectors);
+    let (cs, selector_polys, compressed_selectors) = cs.compress_selectors(assembly.selectors);
     fixed.extend(
         selector_polys
             .into_iter()
@@ -292,10 +292,36 @@ where
         .map(|poly| vk.domain.lagrange_to_coeff(poly.clone()))
         .collect();
 
-    let fixed_cosets = fixed_polys
+    let mut fixed_cosets = fixed_polys
         .iter()
         .map(|poly| vk.domain.coeff_to_extended(poly.clone()))
-        .collect();
+        .collect::<Vec<_>>();
+
+    let mut compressed_selector_cosets = vec![];
+    for (column_index, combination_len, assigned_root) in compressed_selectors
+        .into_iter()
+        .filter(|(_, combination_len, _)| *combination_len >= 4)
+    {
+        let mut selector = fixed_cosets[column_index].clone();
+        for value in selector.iter_mut() {
+            let query = *value;
+            let mut result = query;
+            for root in 1..=combination_len {
+                if root != assigned_root {
+                    result *= C::Scalar::from(root as u64) - query;
+                }
+            }
+            *value = result;
+        }
+        let selector_index = fixed_cosets.len();
+        fixed_cosets.push(selector);
+        compressed_selector_cosets.push(super::CompressedSelectorCoset {
+            column_index,
+            combination_len,
+            assigned_root,
+            selector_index,
+        });
+    }
 
     let permutation_pk = assembly
         .permutation
@@ -332,6 +358,7 @@ where
         fixed_values: fixed,
         fixed_polys,
         fixed_cosets,
+        compressed_selector_cosets,
         permutation: permutation_pk,
     })
 }

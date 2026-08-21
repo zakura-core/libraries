@@ -380,6 +380,15 @@ pub fn create_proof<
         .map(|poly| coset_evaluator.register_poly(poly.clone()))
         .collect();
 
+    for selector in &pk.compressed_selector_cosets {
+        coset_evaluator.register_compressed_selector(
+            fixed_cosets[selector.column_index],
+            selector.combination_len,
+            selector.assigned_root,
+            fixed_cosets[selector.selector_index],
+        );
+    }
+
     // Register advice cosets with the polynomial evaluator.
     let advice_cosets: Vec<_> = advice
         .iter()

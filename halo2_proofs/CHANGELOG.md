@@ -33,6 +33,8 @@ and this project adheres to Rust's notion of
 - Polynomial evaluation now combines compressed-selector contributions with a
   product tree, avoiding construction of every selector value separately, and
   adds unit-weighted terms without a field multiplication.
+- Proving keys now cache compressed-selector evaluations over the extended
+  domain for reuse during quotient construction.
 - Polynomial evaluation now caches repeated expressions whenever doing so
   avoids at least one field multiplication, and reuses cache buffers with
   disjoint lifetimes.
