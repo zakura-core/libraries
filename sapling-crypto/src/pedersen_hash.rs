@@ -4,11 +4,8 @@
 pub(crate) mod test_vectors;
 
 use alloc::vec::Vec;
-use core::ops::{AddAssign, Neg};
-use ff::PrimeField;
-use group::Group;
 
-use super::constants::{PEDERSEN_HASH_CHUNKS_PER_GENERATOR, PEDERSEN_HASH_EXP_WINDOW_SIZE};
+use super::constants::PEDERSEN_HASH_CHUNKS_PER_GENERATOR;
 
 #[derive(Copy, Clone)]
 pub enum Personalization {
@@ -29,51 +26,91 @@ impl Personalization {
     }
 }
 
-pub fn pedersen_hash<I>(personalization: Personalization, bits: I) -> jubjub::SubgroupPoint
+/// Pedersen hash of `bits` under `personalization`.
+///
+/// The default implementation is the original 8-bit exp-window evaluation. Enable the
+/// `fused-pedersen` feature to use fused chunk-block lookup tables instead; both paths
+/// produce the same prime-order point.
+pub fn pedersen_hash<I>(personalization: Personalization, bits: I) -> jubjub::ExtendedPoint
 where
     I: IntoIterator<Item = bool>,
 {
-    let mut bits = personalization.get_bits().into_iter().chain(bits);
+    let bits = collect_bounded_bits(personalization, bits);
 
+    #[cfg(feature = "fused-pedersen")]
+    {
+        fused_pedersen_hash(&bits)
+    }
+    #[cfg(not(feature = "fused-pedersen"))]
+    {
+        windowed_pedersen_hash(&bits)
+    }
+}
+
+/// Buffer the bit stream so we know the exact length up front, but stop after the fixed
+/// generator capacity. This keeps oversized or infinite public-API inputs from causing
+/// unbounded allocation.
+fn collect_bounded_bits<I>(personalization: Personalization, bits: I) -> Vec<bool>
+where
+    I: IntoIterator<Item = bool>,
+{
+    let max_bits =
+        crate::constants::PEDERSEN_HASH_GENERATORS.len() * PEDERSEN_HASH_CHUNKS_PER_GENERATOR * 3;
+    let bits: Vec<bool> = personalization
+        .get_bits()
+        .into_iter()
+        .chain(bits)
+        .take(max_bits + 1)
+        .collect();
+    assert!(
+        bits.len() <= max_bits,
+        "we don't have enough Pedersen hash generators"
+    );
+    bits
+}
+
+#[cfg(not(feature = "fused-pedersen"))]
+fn windowed_pedersen_hash(bits: &[bool]) -> jubjub::ExtendedPoint {
+    use core::ops::{AddAssign, Neg};
+    use ff::{Field, PrimeField};
+    use group::Group;
+
+    use super::constants::PEDERSEN_HASH_EXP_WINDOW_SIZE;
+
+    let mut bits = bits.iter().copied();
     let mut result = jubjub::SubgroupPoint::identity();
     let mut generators = crate::constants::PEDERSEN_HASH_EXP_TABLE.iter();
 
     loop {
-        let mut acc = jubjub::Fr::zero();
-        let mut cur = jubjub::Fr::one();
+        let mut acc = jubjub::Fr::ZERO;
+        let mut cur = jubjub::Fr::ONE;
         let mut chunks_remaining = PEDERSEN_HASH_CHUNKS_PER_GENERATOR;
         let mut encountered_bits = false;
 
-        // Grab three bits from the input
         while let Some(a) = bits.next() {
             encountered_bits = true;
 
             let b = bits.next().unwrap_or(false);
             let c = bits.next().unwrap_or(false);
 
-            // Start computing this portion of the scalar
             let mut tmp = cur;
             if a {
                 tmp.add_assign(&cur);
             }
-            cur = cur.double(); // 2^1 * cur
+            cur = cur.double();
             if b {
                 tmp.add_assign(&cur);
             }
-
-            // conditionally negate
             if c {
                 tmp = tmp.neg();
             }
-
             acc.add_assign(&tmp);
 
             chunks_remaining -= 1;
-
             if chunks_remaining == 0 {
                 break;
             } else {
-                cur = cur.double().double().double(); // 2^4 * cur
+                cur = cur.double().double().double();
             }
         }
 
@@ -105,10 +142,8 @@ where
             let u64_idx = pos / 64;
             let bit_idx = pos % 64;
             let i = (if bit_idx + window < 64 {
-                // This window's bits are contained in a single u64.
                 limbs[u64_idx] >> bit_idx
             } else {
-                // Combine the current u64's bits with the bits from the next u64.
                 (limbs[u64_idx] >> bit_idx) | (limbs[u64_idx + 1] << (64 - bit_idx))
             } & window_mask) as usize;
 
@@ -119,6 +154,68 @@ where
         }
 
         result += tmp;
+    }
+
+    jubjub::ExtendedPoint::from(result)
+}
+
+#[cfg(feature = "fused-pedersen")]
+fn fused_pedersen_hash(bits: &[bool]) -> jubjub::ExtendedPoint {
+    use super::constants::PEDERSEN_HASH_CHUNKS_PER_BLOCK;
+
+    // The trailing bits of the final chunk are zero-padded (matching Sapling's definition),
+    // but chunks beyond the message must never be added.
+    let bit = |i: usize| -> usize { usize::from(bits.get(i).copied().unwrap_or(false)) };
+
+    let total_chunks = bits.len().div_ceil(3);
+
+    let block_tables = &*crate::constants::PEDERSEN_HASH_BLOCK_TABLE;
+    let single_tables = &*crate::constants::PEDERSEN_HASH_SINGLE_TABLE;
+
+    // The table entries are precomputed-addition (Niels) points; accumulate into an extended
+    // point via fast mixed additions.
+    let mut result = jubjub::ExtendedPoint::identity();
+
+    // Walk the chunks segment by segment (one generator per segment of
+    // `PEDERSEN_HASH_CHUNKS_PER_GENERATOR` chunks), accumulating each chunk's precomputed
+    // contribution `enc(chunk) * 2^{4j} * G`.
+    let mut chunk = 0;
+    let mut generator = 0;
+    while chunk < total_chunks {
+        let block_table = block_tables
+            .get(generator)
+            .expect("we don't have enough generators");
+        let single_table = &single_tables[generator];
+
+        let segment_end = core::cmp::min(chunk + PEDERSEN_HASH_CHUNKS_PER_GENERATOR, total_chunks);
+
+        // `position` is the chunk's index within this segment, used to weight by 2^{4*position}.
+        let mut position = 0;
+
+        // Fold whole blocks of `PEDERSEN_HASH_CHUNKS_PER_BLOCK` chunks with a single lookup.
+        while segment_end - chunk >= PEDERSEN_HASH_CHUNKS_PER_BLOCK {
+            let mut raw = 0;
+            for k in 0..PEDERSEN_HASH_CHUNKS_PER_BLOCK {
+                let base = 3 * (chunk + k);
+                raw |= (bit(base) | (bit(base + 1) << 1) | (bit(base + 2) << 2)) << (3 * k);
+            }
+            result += block_table[position / PEDERSEN_HASH_CHUNKS_PER_BLOCK][raw];
+
+            chunk += PEDERSEN_HASH_CHUNKS_PER_BLOCK;
+            position += PEDERSEN_HASH_CHUNKS_PER_BLOCK;
+        }
+
+        // Any chunks that do not fill a block (the tail of the final segment) are added singly.
+        while chunk < segment_end {
+            let base = 3 * chunk;
+            let raw = bit(base) | (bit(base + 1) << 1) | (bit(base + 2) << 2);
+            result += single_table[position][raw];
+
+            chunk += 1;
+            position += 1;
+        }
+
+        generator += 1;
     }
 
     result
@@ -150,14 +247,123 @@ pub mod test {
             // The 6 bits prefix is handled separately
             assert_eq!(v.personalization.get_bits(), &input_bools[..6]);
 
-            let p = jubjub::ExtendedPoint::from(pedersen_hash(
-                v.personalization,
-                input_bools.into_iter().skip(6),
-            ))
-            .to_affine();
+            let p = pedersen_hash(v.personalization, input_bools.into_iter().skip(6)).to_affine();
 
             assert_eq!(p.get_u().to_string(), v.hash_u);
             assert_eq!(p.get_v().to_string(), v.hash_v);
         }
+    }
+
+    /// Straightforward reference implementation: accumulate each segment's scalar and multiply
+    /// the segment generator directly. The optimized [`pedersen_hash`] must match this exactly.
+    fn reference_pedersen_hash(
+        personalization: Personalization,
+        input: &[bool],
+    ) -> jubjub::ExtendedPoint {
+        use core::ops::AddAssign;
+        use ff::Field;
+
+        let mut bits = personalization
+            .get_bits()
+            .into_iter()
+            .chain(input.iter().copied());
+        let mut result = jubjub::ExtendedPoint::identity();
+        let mut generators = crate::constants::PEDERSEN_HASH_GENERATORS.iter();
+
+        loop {
+            let mut acc = jubjub::Fr::ZERO;
+            let mut cur = jubjub::Fr::ONE;
+            let mut chunks_remaining = PEDERSEN_HASH_CHUNKS_PER_GENERATOR;
+            let mut encountered_bits = false;
+
+            while let Some(a) = bits.next() {
+                encountered_bits = true;
+                let b = bits.next().unwrap_or(false);
+                let c = bits.next().unwrap_or(false);
+
+                let mut tmp = cur;
+                if a {
+                    tmp.add_assign(&cur);
+                }
+                cur = cur.double();
+                if b {
+                    tmp.add_assign(&cur);
+                }
+                if c {
+                    tmp = -tmp;
+                }
+                acc.add_assign(&tmp);
+
+                chunks_remaining -= 1;
+                if chunks_remaining == 0 {
+                    break;
+                } else {
+                    cur = cur.double().double().double();
+                }
+            }
+
+            if !encountered_bits {
+                break;
+            }
+
+            let g = generators.next().expect("we don't have enough generators");
+            result += g * acc;
+        }
+
+        result
+    }
+
+    #[test]
+    fn matches_reference_across_boundaries() {
+        // Deterministic xorshift PRNG so the test needs no rng dependency.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next_bit = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state & 1 == 1
+        };
+
+        // Cover empty input, sub-chunk lengths, exact chunk/generator boundaries (a generator is
+        // 63 chunks = 189 bits; the 6 prepended personalization bits shift the boundaries), the
+        // merkle-hash size (510 input bits), and multi-generator inputs up to capacity (six
+        // generators hold 1134 bits total, so at most 1128 input bits after personalization).
+        let lengths = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 180, 181, 182, 183, 184, 185, 186, 369, 370, 371, 372,
+            373, 374, 510, 516, 564, 1125, 1126, 1127, 1128,
+        ];
+
+        for personalization in [
+            Personalization::NoteCommitment,
+            Personalization::MerkleTree(31),
+        ] {
+            for &len in &lengths {
+                let input: Vec<bool> = (0..len).map(|_| next_bit()).collect();
+                assert_eq!(
+                    pedersen_hash(personalization, input.iter().copied()),
+                    reference_pedersen_hash(personalization, &input),
+                    "mismatch at input length {len}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "we don't have enough Pedersen hash generators")]
+    fn rejects_one_bit_over_generator_capacity() {
+        let max_input_bits = crate::constants::PEDERSEN_HASH_GENERATORS.len()
+            * PEDERSEN_HASH_CHUNKS_PER_GENERATOR
+            * 3
+            - Personalization::NoteCommitment.get_bits().len();
+        pedersen_hash(
+            Personalization::NoteCommitment,
+            core::iter::repeat_n(true, max_input_bits + 1),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "we don't have enough Pedersen hash generators")]
+    fn rejects_infinite_input_at_generator_capacity() {
+        pedersen_hash(Personalization::NoteCommitment, core::iter::repeat(true));
     }
 }
