@@ -69,6 +69,9 @@ and this project adheres to Rust's notion of
 
 ### Changed
 
+- Hash-to-curve now avoids redundant release-mode curve-equation checks after
+  the simplified SWU and isogeny formulas, while retaining debug assertions.
+  Vesta hash-to-curve is about 5% faster on Apple aarch64.
 - `Fp` and `Fq` square-root table lookups now hash their normalized
   Montgomery representations directly with generated multiply-and-shift
   perfect hashes. This removes four Montgomery reductions and four integer
